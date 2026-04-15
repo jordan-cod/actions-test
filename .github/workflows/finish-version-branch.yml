@@ -252,9 +252,36 @@ jobs:
               } catch (err) {
                 console.log(`ℹ️ Could not add label (may not exist): ${err.message}`);
               }
+              console.log(`⚠️ Created PR (needs human review): ${pr.data.html_url}`);
+              return;
             }
 
-            console.log(`${hasConflict ? '⚠️' : '✅'} Created PR: ${pr.data.html_url}`);
+            console.log(`✅ Created PR: ${pr.data.html_url}`);
+
+            // Auto-merge clean merge-back PRs. GitHub may not have computed mergeability
+            // yet right after creation, so retry briefly.
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+            for (let attempt = 1; attempt <= 6; attempt++) {
+              try {
+                await github.rest.pulls.merge({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: pr.data.number,
+                  merge_method: 'merge', // never squash — preserve SHAs
+                });
+                console.log(`✅ Auto-merged PR #${pr.data.number}`);
+                return;
+              } catch (err) {
+                const msg = err.message || '';
+                const transient = err.status === 405 || /not mergeable|Base branch was modified|merge_pull_request/i.test(msg);
+                if (attempt === 6 || !transient) {
+                  console.log(`ℹ️ Auto-merge skipped (${err.status}): ${msg}. PR left open for manual merge.`);
+                  return;
+                }
+                console.log(`⏳ Auto-merge attempt ${attempt} not ready (${err.status}); retrying...`);
+                await sleep(5000);
+              }
+            }
 
   delete-version-branch:
     runs-on: ubuntu-latest
@@ -311,10 +338,7 @@ jobs:
           echo "- ✅ Deleted version branch"
 
           if [ "$MERGE_STATUS" = "success" ]; then
-            echo "- ✅ PR created to merge main back into develop"
-            echo ""
-            echo "### Next Steps:"
-            echo "1. Review and merge the PR (main -> develop)"
+            echo "- ✅ Merge-back PR created and auto-merged into develop"
           elif [ "$MERGE_STATUS" = "conflict" ]; then
             echo "- ⚠️ Merge-back PR created with conflicts — needs human review"
             echo ""
