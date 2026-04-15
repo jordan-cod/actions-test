@@ -270,6 +270,16 @@ jobs:
                   merge_method: 'merge', // never squash — preserve SHAs
                 });
                 console.log(`✅ Auto-merged PR #${pr.data.number}`);
+                try {
+                  await github.rest.issues.addLabels({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: pr.data.number,
+                    labels: ['auto-merged'],
+                  });
+                } catch (err) {
+                  console.log(`ℹ️ Could not add auto-merged label: ${err.message}`);
+                }
                 return;
               } catch (err) {
                 const msg = err.message || '';
