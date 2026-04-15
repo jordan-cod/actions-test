@@ -280,6 +280,16 @@ jobs:
                 } catch (err) {
                   console.log(`ℹ️ Could not add auto-merged label: ${err.message}`);
                 }
+                try {
+                  await github.rest.git.deleteRef({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    ref: `heads/${mergeBranch}`,
+                  });
+                  console.log(`🧹 Deleted merge-back branch: ${mergeBranch}`);
+                } catch (err) {
+                  console.log(`ℹ️ Could not delete merge-back branch: ${err.message}`);
+                }
                 return;
               } catch (err) {
                 const msg = err.message || '';
