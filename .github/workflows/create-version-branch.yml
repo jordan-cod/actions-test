@@ -1,0 +1,311 @@
+name: Create Version Branch
+
+on:
+  workflow_dispatch:
+    inputs:
+      type:
+        description: "Tipo de branch a ser criada"
+        required: true
+        type: choice
+        options:
+          - hotfix
+          - release
+        default: "hotfix"
+      breaking_changes:
+        description: "Há breaking changes? (apenas para release)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  create-version-branch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      branch-name: ${{ steps.check-branch.outputs.branch-name }}
+      new-version: ${{ steps.calculate-version.outputs.new-version }}
+      branch-type: ${{ steps.check-branch.outputs.branch-type }}
+      branch-exists: ${{ steps.check-branch.outputs.branch-exists }}
+
+    steps:
+      - name: Determine base branch
+        id: determine-base
+        run: |
+          TYPE="${{ inputs.type }}"
+          if [ "$TYPE" = "hotfix" ]; then
+            BASE_BRANCH="main"
+            echo "🔥 Hotfix: Using main as base branch"
+          else
+            BASE_BRANCH="develop"
+            echo "🚀 Release: Using develop as base branch"
+          fi
+          echo "base-branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.determine-base.outputs.base-branch }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Confirm checked out branch
+        run: |
+          echo "📍 Currently on branch: $(git branch --show-current)"
+          echo "📍 Latest commit: $(git log -1 --oneline)"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+
+      - name: Get user email
+        id: get-user-email
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const user = await github.rest.users.getByUsername({
+              username: context.actor
+            });
+            return user.data.email || `${context.actor}@users.noreply.github.com`;
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "${{ github.actor }}"
+          git config --global user.email "${{ steps.get-user-email.outputs.result }}"
+
+      - name: Get current version
+        id: get-version
+        run: |
+          CURRENT_VERSION=$(node -p "require('./package.json').version")
+          echo "current-version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "Current version: $CURRENT_VERSION"
+
+      - name: Calculate new version
+        id: calculate-version
+        run: |
+          CURRENT_VERSION="${{ steps.get-version.outputs.current-version }}"
+          TYPE="${{ inputs.type }}"
+          BREAKING_CHANGES="${{ inputs.breaking_changes }}"
+
+          # Parse version components
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
+
+          if [ "$TYPE" = "hotfix" ]; then
+            # Hotfix: increment patch
+            NEW_PATCH=$((PATCH + 1))
+            NEW_VERSION="$MAJOR.$MINOR.$NEW_PATCH"
+          elif [ "$TYPE" = "release" ]; then
+            if [ "$BREAKING_CHANGES" = "true" ]; then
+              # Release with breaking changes: increment major, reset minor and patch
+              NEW_MAJOR=$((MAJOR + 1))
+              NEW_VERSION="$NEW_MAJOR.0.0"
+            else
+              # Release without breaking changes: increment minor, reset patch
+              NEW_MINOR=$((MINOR + 1))
+              NEW_VERSION="$MAJOR.$NEW_MINOR.0"
+            fi
+          fi
+
+          echo "new-version=$NEW_VERSION" >> $GITHUB_OUTPUT
+          echo "New version: $NEW_VERSION"
+
+      - name: Check if branch already exists
+        id: check-branch
+        run: |
+          TYPE="${{ inputs.type }}"
+          NEW_VERSION="${{ steps.calculate-version.outputs.new-version }}"
+          BRANCH_NAME="${TYPE}/v${NEW_VERSION}"
+          BASE_BRANCH="${{ steps.determine-base.outputs.base-branch }}"
+
+          # Check if branch exists remotely
+          if git ls-remote --heads origin "$BRANCH_NAME" | grep -q "$BRANCH_NAME"; then
+            echo "branch-exists=true" >> $GITHUB_OUTPUT
+            echo "⚠️ Branch $BRANCH_NAME already exists, skipping creation..."
+          else
+            echo "branch-exists=false" >> $GITHUB_OUTPUT
+            echo "✅ Branch $BRANCH_NAME does not exist, will create it from $BASE_BRANCH..."
+          fi
+
+          echo "branch-name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          echo "branch-type=$TYPE" >> $GITHUB_OUTPUT
+          echo "base-branch=$BASE_BRANCH" >> $GITHUB_OUTPUT
+
+      - name: Update package.json
+        if: steps.check-branch.outputs.branch-exists == 'false'
+        run: |
+          NEW_VERSION="${{ steps.calculate-version.outputs.new-version }}"
+
+          # Update package.json version
+          node -e "
+            const fs = require('fs');
+            const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+            pkg.version = '$NEW_VERSION';
+            fs.writeFileSync('package.json', JSON.stringify(pkg, null, 2) + '\n');
+          "
+
+      - name: Commit version bump
+        if: steps.check-branch.outputs.branch-exists == 'false'
+        run: |
+          NEW_VERSION="${{ steps.calculate-version.outputs.new-version }}"
+          git add package.json
+          git commit -m "chore(version): bump to v$NEW_VERSION"
+
+      - name: Create and push branch
+        if: steps.check-branch.outputs.branch-exists == 'false'
+        run: |
+          BRANCH_NAME="${{ steps.check-branch.outputs.branch-name }}"
+
+          # Create and push branch
+          git checkout -b "$BRANCH_NAME"
+          git push origin "$BRANCH_NAME"
+          echo "✅ Branch $BRANCH_NAME created and pushed successfully!"
+
+  create-pr-to-main:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: create-version-branch
+    if: always() && needs.create-version-branch.result == 'success'
+    outputs:
+      pr-number: ${{ steps.create-or-find-pr.outputs.result }}
+      pr-url: ${{ steps.create-or-find-pr.outputs.pr-url }}
+
+    steps:
+      - name: Create or Find Pull Request to main
+        id: create-or-find-pr
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_PERSONAL_TOKEN }}
+          script: |
+            const { type } = context.payload.inputs;
+            const newVersion = '${{ needs.create-version-branch.outputs.new-version }}';
+            const branchName = '${{ needs.create-version-branch.outputs.branch-name }}';
+            const approvers = '${{ vars.APPROVERS }}';
+
+            const title = `[${type.toUpperCase()}] v${newVersion} -> main`;
+            const description = `This ${type} branch bumps the version to v${newVersion}.\n\nAutomatically generated by workflow.`;
+
+            try {
+              // Check if PR already exists
+              const existingPRs = await github.rest.pulls.list({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                head: `${context.repo.owner}:${branchName}`,
+                base: 'main',
+                state: 'open'
+              });
+
+              let prNumber;
+              let isNewPR = false;
+
+              if (existingPRs.data.length > 0) {
+                const existingPR = existingPRs.data[0];
+                prNumber = existingPR.number;
+                console.log(`⚠️ PR to main already exists: ${existingPR.html_url}`);
+                core.exportVariable('pr-url', existingPR.html_url);
+              } else {
+                // Create PR to main
+                const mainPR = await github.rest.pulls.create({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  title: title,
+                  head: branchName,
+                  base: 'main',
+                  body: description
+                });
+
+                prNumber = mainPR.data.number;
+                isNewPR = true;
+                console.log(`✅ Created PR to main: ${mainPR.data.html_url}`);
+                core.exportVariable('pr-url', mainPR.data.html_url);
+              }
+
+              // Add assignees if APPROVERS is defined
+              if (approvers && approvers.trim()) {
+                const assigneesList = approvers.split(',').map(u => u.trim()).filter(u => u);
+
+                if (assigneesList.length > 0) {
+                  try {
+                    await github.rest.issues.addAssignees({
+                      owner: context.repo.owner,
+                      repo: context.repo.repo,
+                      issue_number: prNumber,
+                      assignees: assigneesList
+                    });
+                    console.log(`✅ Added assignees: ${assigneesList.join(', ')}`);
+                  } catch (assigneeError) {
+                    console.log(`⚠️ Could not add assignees: ${assigneeError.message}`);
+                  }
+                }
+              }
+
+              return prNumber;
+            } catch (error) {
+              if (error.status === 422 && error.message.includes('pull request already exists')) {
+                console.log('⚠️ PR already exists, attempting to find it...');
+                const existingPRs = await github.rest.pulls.list({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  head: `${context.repo.owner}:${branchName}`,
+                  base: 'main',
+                  state: 'all'
+                });
+
+                if (existingPRs.data.length > 0) {
+                  const existingPR = existingPRs.data[0];
+                  console.log(`Found existing PR: ${existingPR.html_url}`);
+                  core.exportVariable('pr-url', existingPR.html_url);
+                  return existingPR.number;
+                }
+              }
+              throw error;
+            }
+
+  summary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    needs: [create-version-branch, create-pr-to-main]
+    if: always() && needs.create-version-branch.result == 'success'
+
+    steps:
+      - name: Summary
+        run: |
+          echo "## 🎉 Version Branch Process Completed!"
+          echo ""
+          echo "**Branch:** ${{ needs.create-version-branch.outputs.branch-name }}"
+          echo "**New Version:** ${{ needs.create-version-branch.outputs.new-version }}"
+          echo "**Type:** ${{ needs.create-version-branch.outputs.branch-type }}"
+          echo ""
+
+          # Branch creation status
+          if [ "${{ needs.create-version-branch.outputs.branch-exists }}" = "true" ]; then
+            echo "**Branch Status:** ⚠️ Branch already existed (skipped creation)"
+          else
+            echo "**Branch Status:** ✅ Branch created successfully"
+          fi
+
+          echo ""
+          echo "### Pull Request Status:"
+
+          # PR to main status
+          if [ "${{ needs.create-pr-to-main.result }}" = "success" ]; then
+            PR_NUMBER_MAIN="${{ needs.create-pr-to-main.outputs.pr-number }}"
+            if [ -n "$PR_NUMBER_MAIN" ]; then
+              echo "- ✅ PR to main: #$PR_NUMBER_MAIN"
+              echo "  - URL: ${{ github.server_url }}/${{ github.repository }}/pull/$PR_NUMBER_MAIN"
+            else
+              echo "- ✅ PR to main: Created/Found successfully"
+            fi
+          else
+            echo "- ❌ PR to main: Failed"
+          fi
+
+          echo ""
+          echo "### Next Steps:"
+          echo "1. Review and merge the PR to main"
+          echo "2. Develop will be updated automatically after merge (via finish-version-branch workflow)"

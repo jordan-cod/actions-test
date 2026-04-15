@@ -1,0 +1,328 @@
+name: Finish Version Branch
+
+on:
+  pull_request:
+    types: [closed]
+    branches:
+      - main
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  validate-version-branch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    if: github.event.pull_request.merged == true
+    outputs:
+      is-version-branch: ${{ steps.check-branch.outputs.is-version-branch }}
+      branch-name: ${{ github.head_ref }}
+      branch-type: ${{ steps.check-branch.outputs.branch-type }}
+      version: ${{ steps.check-branch.outputs.version }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Check if branch is version branch
+        id: check-branch
+        run: |
+          BRANCH_NAME="${{ github.head_ref }}"
+
+          if [[ "$BRANCH_NAME" =~ ^(hotfix|release)/v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "is-version-branch=true" >> $GITHUB_OUTPUT
+            echo "branch-type=$(echo $BRANCH_NAME | cut -d'/' -f1)" >> $GITHUB_OUTPUT
+            echo "version=$(echo $BRANCH_NAME | cut -d'/' -f2 | sed 's/v//')" >> $GITHUB_OUTPUT
+            echo "✅ This is a version branch: $BRANCH_NAME"
+          else
+            echo "is-version-branch=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ Not a version branch, skipping workflow"
+          fi
+
+      - name: Get version from package.json
+        if: steps.check-branch.outputs.is-version-branch == 'true'
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          echo "📦 Project version: $VERSION"
+          echo "🏷️ Tag version: ${{ steps.check-branch.outputs.version }}"
+
+  create-tag:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    needs: validate-version-branch
+    if: needs.validate-version-branch.outputs.is-version-branch == 'true'
+    outputs:
+      tag-created: ${{ steps.create-tag.outputs.tag-created }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get user email
+        id: get-user-email
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const user = await github.rest.users.getByUsername({
+              username: context.actor
+            });
+            return user.data.email || `${context.actor}@users.noreply.github.com`;
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "${{ github.actor }}"
+          git config --global user.email "${{ steps.get-user-email.outputs.result }}"
+
+      - name: Create and push Git tag
+        id: create-tag
+        run: |
+          VERSION="${{ needs.validate-version-branch.outputs.version }}"
+
+          # Check if tag already exists
+          if git rev-parse "v$VERSION" >/dev/null 2>&1; then
+            echo "⚠️ Tag v$VERSION already exists, skipping creation"
+            echo "tag-created=false" >> $GITHUB_OUTPUT
+          else
+            git tag -a "v$VERSION" -m "Release version $VERSION"
+            git push origin "v$VERSION"
+            echo "✅ Created and pushed tag: v$VERSION"
+            echo "tag-created=true" >> $GITHUB_OUTPUT
+          fi
+
+  merge-to-develop:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [validate-version-branch, create-tag]
+    if: needs.validate-version-branch.outputs.is-version-branch == 'true'
+    outputs:
+      merge-status: ${{ steps.merge.outputs.merge-status }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Get user email
+        id: get-user-email
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const user = await github.rest.users.getByUsername({
+              username: context.actor
+            });
+            return user.data.email || `${context.actor}@users.noreply.github.com`;
+
+      - name: Configure Git
+        run: |
+          git config --global user.name "${{ github.actor }}"
+          git config --global user.email "${{ steps.get-user-email.outputs.result }}"
+
+      - name: Merge main into develop via branch
+        id: merge
+        run: |
+          BRANCH_TYPE="${{ needs.validate-version-branch.outputs.branch-type }}"
+          VERSION="${{ needs.validate-version-branch.outputs.version }}"
+          MERGE_BRANCH="merge-back/main-to-develop-v${VERSION}"
+
+          git checkout develop
+          git pull origin develop
+
+          # Create temp branch from develop
+          git checkout -b "$MERGE_BRANCH"
+
+          # Try normal merge first
+          MERGE_OUTCOME="clean"
+          CONFLICTING_FILES=""
+          if git merge origin/main --no-ff -m "Merge main into develop after $BRANCH_TYPE v$VERSION" --no-verify; then
+            echo "✅ Merge succeeded without conflicts"
+          else
+            CONFLICTING_FILES=$(git diff --name-only --diff-filter=U)
+            if [ "$CONFLICTING_FILES" = "package.json" ]; then
+              # Only safe to auto-resolve if the sole difference is the `version` field.
+              # Otherwise `--theirs` would silently drop develop-side changes (deps, scripts, etc.).
+              OURS_NO_VERSION=$(git show :2:package.json | jq -S 'del(.version)')
+              THEIRS_NO_VERSION=$(git show :3:package.json | jq -S 'del(.version)')
+              if [ "$OURS_NO_VERSION" = "$THEIRS_NO_VERSION" ]; then
+                echo "⚠️ Only the version field differs in package.json — resolving with main's value"
+                git checkout --theirs package.json
+                git add package.json
+                git commit --no-edit --no-verify
+              else
+                echo "❌ package.json has non-version conflicts — needs human review"
+                git merge --abort
+                MERGE_OUTCOME="conflict"
+              fi
+            else
+              echo "❌ Conflicts in files other than package.json:"
+              echo "$CONFLICTING_FILES"
+              git merge --abort
+              MERGE_OUTCOME="conflict"
+            fi
+          fi
+
+          if [ "$MERGE_OUTCOME" = "clean" ]; then
+            git push origin "$MERGE_BRANCH" --no-verify
+            {
+              echo "merge-branch=$MERGE_BRANCH"
+              echo "merge-status=success"
+            } >> $GITHUB_OUTPUT
+            echo "✅ Created merge branch: $MERGE_BRANCH"
+          else
+            # Recreate temp branch from main so the PR shows main's diff vs develop
+            # (conflicts will be visible on the PR; human resolves locally and pushes)
+            git checkout main
+            git branch -D "$MERGE_BRANCH" 2>/dev/null || true
+            git checkout -b "$MERGE_BRANCH"
+            git push origin "$MERGE_BRANCH" --no-verify
+            {
+              echo "merge-branch=$MERGE_BRANCH"
+              echo "merge-status=conflict"
+              echo "conflicting-files<<EOF"
+              echo "$CONFLICTING_FILES"
+              echo "EOF"
+            } >> $GITHUB_OUTPUT
+            echo "⚠️ Created conflict-resolution branch: $MERGE_BRANCH"
+          fi
+
+      - name: Create PR to develop
+        if: steps.merge.outputs.merge-status == 'success' || steps.merge.outputs.merge-status == 'conflict'
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GH_PERSONAL_TOKEN }}
+          script: |
+            const version = '${{ needs.validate-version-branch.outputs.version }}';
+            const branchType = '${{ needs.validate-version-branch.outputs.branch-type }}';
+            const mergeBranch = '${{ steps.merge.outputs.merge-branch }}';
+            const mergeStatus = '${{ steps.merge.outputs.merge-status }}';
+            const conflictingFiles = `${{ steps.merge.outputs.conflicting-files }}`;
+
+            const hasConflict = mergeStatus === 'conflict';
+
+            const title = hasConflict
+              ? `[CONFLICT] main -> develop after ${branchType} v${version}`
+              : `[MERGE-BACK] main -> develop after ${branchType} v${version}`;
+
+            const body = hasConflict
+              ? [
+                  `⚠️ Automated merge of main into develop after ${branchType} v${version} could not complete due to conflicts.`,
+                  ``,
+                  `**Conflicting files:**`,
+                  '```',
+                  conflictingFiles,
+                  '```',
+                  ``,
+                  `**Resolve locally:**`,
+                  '```bash',
+                  `git fetch origin`,
+                  `git checkout ${mergeBranch}`,
+                  `git merge origin/develop`,
+                  `# resolve conflicts, then:`,
+                  `git push origin ${mergeBranch}`,
+                  '```',
+                ].join('\n')
+              : `Automated merge of main into develop after ${branchType} v${version}.`;
+
+            const pr = await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              head: mergeBranch,
+              base: 'develop',
+              body,
+            });
+
+            if (hasConflict) {
+              try {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: pr.data.number,
+                  labels: ['needs-human-review'],
+                });
+              } catch (err) {
+                console.log(`ℹ️ Could not add label (may not exist): ${err.message}`);
+              }
+            }
+
+            console.log(`${hasConflict ? '⚠️' : '✅'} Created PR: ${pr.data.html_url}`);
+
+  delete-version-branch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    needs: [validate-version-branch, create-tag]
+    if: |
+      always() &&
+      needs.validate-version-branch.outputs.is-version-branch == 'true' &&
+      needs.create-tag.result == 'success'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Delete version branch
+        run: |
+          BRANCH_NAME="${{ needs.validate-version-branch.outputs.branch-name }}"
+          git push origin --delete "$BRANCH_NAME"
+          echo "✅ Deleted version branch: $BRANCH_NAME"
+
+  summary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    needs: [validate-version-branch, create-tag, merge-to-develop, delete-version-branch]
+    if: always() && needs.validate-version-branch.outputs.is-version-branch == 'true'
+
+    steps:
+      - name: Generate Summary
+        run: |
+          TAG_CREATED="${{ needs.create-tag.outputs.tag-created }}"
+          VERSION="${{ needs.validate-version-branch.outputs.version }}"
+          BRANCH_NAME="${{ needs.validate-version-branch.outputs.branch-name }}"
+          BRANCH_TYPE="${{ needs.validate-version-branch.outputs.branch-type }}"
+          MERGE_RESULT="${{ needs.merge-to-develop.result }}"
+          MERGE_STATUS="${{ needs.merge-to-develop.outputs.merge-status }}"
+
+          echo "**Branch:** $BRANCH_NAME"
+          echo "**Version:** $VERSION"
+          echo "**Type:** $BRANCH_TYPE"
+          echo ""
+
+          echo "### Actions Completed:"
+          echo "- ✅ PR merged to main"
+
+          if [ "$TAG_CREATED" = "true" ]; then
+            echo "- ✅ Created Git tag: v$VERSION"
+          else
+            echo "- ⚠️ Git tag v$VERSION already existed"
+          fi
+
+          echo "- ✅ Deleted version branch"
+
+          if [ "$MERGE_STATUS" = "success" ]; then
+            echo "- ✅ PR created to merge main back into develop"
+            echo ""
+            echo "### Next Steps:"
+            echo "1. Review and merge the PR (main -> develop)"
+          elif [ "$MERGE_STATUS" = "conflict" ]; then
+            echo "- ⚠️ Merge-back PR created with conflicts — needs human review"
+            echo ""
+            echo "### ⚠️ Action Required"
+            echo "Resolve conflicts on the [CONFLICT] merge-back PR (main -> develop)."
+          else
+            echo "- ❌ Failed to create merge-back PR to develop"
+            echo ""
+            echo "### ⚠️ Manual Action Required"
+            echo "Please merge main into develop manually."
+          fi
