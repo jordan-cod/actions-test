@@ -4,5 +4,8 @@
   "description": "Playground for GitHub Actions hotfix flow",
   "scripts": {
     "noop": "echo noop"
+  },
+  "dependencies": {
+    "left-pad": "^1.3.0"
   }
 }
