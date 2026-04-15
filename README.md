@@ -1,4 +1,4 @@
-# actions-test (changed by develop)
+# actions-test (changed by hotfix D)
 
 Sandbox to exercise the `create-version-branch.yml` + `finish-version-branch.yml` flow end-to-end before touching the real repo.
 
