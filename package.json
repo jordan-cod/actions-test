@@ -1,6 +1,6 @@
 {
   "name": "actions-test",
-  "version": "1.1.0-dev",
+  "version": "1.0.3",
   "description": "Playground for GitHub Actions hotfix flow",
   "scripts": {
     "noop": "echo noop"
